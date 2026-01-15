@@ -1,6 +1,7 @@
 package logs
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -46,11 +47,20 @@ func (l *Logger) sendLog(level, msg string, args ...any) {
 
 	logBytes, err := json.Marshal(log)
 	if err != nil {
+		l.logger.Error("Failed to marshal log to JSON", "error", err.Error())
 		return
 	}
 
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, l.url+dispatchEndpoint, strings.NewReader(string(logBytes)))
+	if err != nil {
+		l.logger.Error("Failed to create request to dispatcher", "error", err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", l.apiKey)
+
 	go func() {
-		res, err := l.client.Post(l.url+dispatchEndpoint, "application/json", strings.NewReader(string(logBytes)))
+		res, err := l.client.Do(req)
 		if err != nil {
 			l.isOk = false
 			l.logger.Warn("Failed to send log to dispatcher", "error", err.Error())
