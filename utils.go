@@ -4,25 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 )
 
-func ParseLogLevel(levelStr string) slog.Level {
-	level, ok := logLevels[strings.ToUpper(levelStr)]
-	if !ok {
-		level = slog.LevelInfo
+func (l *Logger) checkDispatcher() bool {
+	if l.opts.URL == "" {
+		return false
 	}
-	return level
+
+	url := l.opts.URL + l.opts.HealthEndpoint
+	res, err := l.client.Get(url)
+	l.isOk = (err == nil && res.StatusCode == http.StatusOK)
+	return l.isOk
 }
 
-func (l *Logger) sendLog(level, msg string, args ...any) {
-	if l.url == "" {
-		return
-	}
-
+func (l *Logger) prepare(level, msg string, args ...any) *http.Request {
 	data := make(map[string]string)
 	length := len(args)
 	if length%2 != 0 {
@@ -41,37 +39,72 @@ func (l *Logger) sendLog(level, msg string, args ...any) {
 		Level:     level,
 		Message:   msg,
 		Timestamp: time.Now(),
-		Source:    l.source,
+		Source:    l.opts.Source,
 		Args:      data,
 	}
+	// DEBUG: Print Args to diagnose marshal error test
+	fmt.Printf("prepare: Args = %#v\n", data)
 
 	logBytes, err := json.Marshal(log)
 	if err != nil {
 		l.logger.Error("Failed to marshal log to JSON", "error", err.Error())
-		return
+		return nil
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, l.url+dispatchEndpoint, strings.NewReader(string(logBytes)))
+	dispatchURL := l.opts.URL + l.opts.DispatchEndpoint
+	reader := strings.NewReader(string(logBytes))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, dispatchURL, reader)
 	if err != nil {
 		l.logger.Error("Failed to create request to dispatcher", "error", err.Error())
-		return
+		return nil
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-API-Key", l.apiKey)
 
-	go func() {
-		res, err := l.client.Do(req)
-		if err != nil {
-			l.isOk = false
-			l.logger.Warn("Failed to send log to dispatcher", "error", err.Error())
-			return
-		}
+	if l.opts.APIKey != "" {
+		req.Header.Set("X-API-Key", l.opts.APIKey)
+	}
 
-		defer res.Body.Close()
-		if res.StatusCode != http.StatusOK {
-			l.logger.Warn("Dispatcher returned unexpected status", "code", res.StatusCode)
-		}
-	}()
+	return req
+}
+
+func (l *Logger) dispatch(req *http.Request) {
+	res, err := l.client.Do(req)
+	if err != nil {
+		l.isOk = false
+		l.logger.Warn("Failed to send log to dispatcher", "error", err.Error())
+		return
+	}
+
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		l.logger.Warn("Dispatcher returned unexpected status", "code", res.StatusCode)
+	}
+}
+
+func (l *Logger) sendLog(level, msg string, args ...any) {
+	if l.opts.URL == "" {
+		return
+	}
+
+	req := l.prepare(level, msg, args...)
+	if req == nil {
+		return
+	}
+
+	go l.dispatch(req)
+}
+
+func (l *Logger) sendLogSync(level, msg string, args ...any) {
+	if l.opts.URL == "" {
+		return
+	}
+
+	req := l.prepare(level, msg, args...)
+	if req == nil {
+		return
+	}
+
+	l.dispatch(req)
 }
 
 func stringify(v any) string {

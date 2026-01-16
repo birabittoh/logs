@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
@@ -12,12 +11,18 @@ import (
 type Logger struct {
 	logger *slog.Logger
 	client *http.Client
-	url    string
-	apiKey string
-	source string
 	isOk   bool
+	opts   Options
+}
 
-	MinDispatchLevel slog.Level
+type Options struct {
+	URL               string
+	APIKey            string
+	Source            string
+	DispatchEndpoint  string
+	HealthEndpoint    string
+	HeartbeatInterval time.Duration
+	MinDispatchLevel  slog.Level
 }
 
 type Log struct {
@@ -33,10 +38,6 @@ const (
 	INFO  = "INFO"
 	WARN  = "WARN"
 	ERROR = "ERROR"
-
-	healthEndpoint    = "/health"
-	dispatchEndpoint  = "/api/log"
-	heartbeatInterval = 5 * time.Minute
 )
 
 var (
@@ -55,27 +56,38 @@ var (
 	}
 )
 
-func New(handler slog.Handler, url, apiKey, source string) *Logger {
-	url = strings.TrimSpace(url)
+func ParseLogLevel(levelStr string) slog.Level {
+	level, ok := logLevels[strings.ToUpper(levelStr)]
+	if !ok {
+		level = slog.LevelInfo
+	}
+	return level
+}
+
+func New(handler slog.Handler, opts Options) *Logger {
+	if opts.HeartbeatInterval <= 0 {
+		opts.HeartbeatInterval = 5 * time.Minute
+	}
+
+	if opts.HealthEndpoint == "" {
+		opts.HealthEndpoint = opts.DispatchEndpoint
+	}
 
 	l := &Logger{
-		logger:           slog.New(handler),
-		client:           &http.Client{Timeout: 5 * time.Second},
-		url:              url,
-		apiKey:           apiKey,
-		source:           source,
-		isOk:             false,
-		MinDispatchLevel: slog.LevelWarn,
+		logger: slog.New(handler),
+		client: &http.Client{Timeout: 5 * time.Second},
+		isOk:   false,
+		opts:   opts,
 	}
 
 	if !l.checkDispatcher() {
 		l.logger.Error("Log dispatcher is not reachable, using local logger only")
-		l.url = ""
+		l.opts.URL = ""
 	} else {
 		l.logger.Info("Log dispatcher is reachable, using remote logging")
 
 		go func() {
-			ticker := time.NewTicker(heartbeatInterval)
+			ticker := time.NewTicker(l.opts.HeartbeatInterval)
 			for range ticker.C {
 				l.checkDispatcher()
 			}
@@ -85,30 +97,26 @@ func New(handler slog.Handler, url, apiKey, source string) *Logger {
 	return l
 }
 
-func (l *Logger) checkDispatcher() bool {
-	if l.url == "" {
-		return false
-	}
-
-	res, err := l.client.Get(l.url + healthEndpoint)
-	l.isOk = (err == nil && res.StatusCode == http.StatusOK)
-	return l.isOk
-}
-
 func (l *Logger) Fatal(msg string, args ...any) {
 	l.logger.Error(msg, args...)
 
-	if l.isOk && l.MinDispatchLevel <= slog.LevelError {
-		l.sendLog(ERROR, msg, args...)
+	if l.isOk && l.opts.MinDispatchLevel <= slog.LevelError {
+		l.sendLogSync(ERROR, msg, args...)
 	}
+}
 
-	os.Exit(1)
+func (l *Logger) FatalContext(ctx context.Context, msg string, args ...any) {
+	l.logger.ErrorContext(ctx, msg, args...)
+
+	if l.isOk && l.opts.MinDispatchLevel <= slog.LevelError {
+		l.sendLogSync(ERROR, msg, args...)
+	}
 }
 
 func (l *Logger) Error(msg string, args ...any) {
 	l.logger.Error(msg, args...)
 
-	if l.isOk && l.MinDispatchLevel <= slog.LevelError {
+	if l.isOk && l.opts.MinDispatchLevel <= slog.LevelError {
 		l.sendLog(ERROR, msg, args...)
 	}
 }
@@ -116,7 +124,7 @@ func (l *Logger) Error(msg string, args ...any) {
 func (l *Logger) ErrorContext(ctx context.Context, msg string, args ...any) {
 	l.logger.ErrorContext(ctx, msg, args...)
 
-	if l.isOk && l.MinDispatchLevel <= slog.LevelError {
+	if l.isOk && l.opts.MinDispatchLevel <= slog.LevelError {
 		l.sendLog(ERROR, msg, args...)
 	}
 }
@@ -132,7 +140,7 @@ func (l *Logger) Warn(msg string, args ...any) {
 func (l *Logger) WarnContext(ctx context.Context, msg string, args ...any) {
 	l.logger.WarnContext(ctx, msg, args...)
 
-	if l.isOk && l.MinDispatchLevel <= slog.LevelWarn {
+	if l.isOk && l.opts.MinDispatchLevel <= slog.LevelWarn {
 		l.sendLog(WARN, msg, args...)
 	}
 }
@@ -148,7 +156,7 @@ func (l *Logger) Info(msg string, args ...any) {
 func (l *Logger) InfoContext(ctx context.Context, msg string, args ...any) {
 	l.logger.InfoContext(ctx, msg, args...)
 
-	if l.isOk && l.MinDispatchLevel <= slog.LevelInfo {
+	if l.isOk && l.opts.MinDispatchLevel <= slog.LevelInfo {
 		l.sendLog(INFO, msg, args...)
 	}
 }
@@ -164,7 +172,7 @@ func (l *Logger) Debug(msg string, args ...any) {
 func (l *Logger) DebugContext(ctx context.Context, msg string, args ...any) {
 	l.logger.DebugContext(ctx, msg, args...)
 
-	if l.isOk && l.MinDispatchLevel <= slog.LevelDebug {
+	if l.isOk && l.opts.MinDispatchLevel <= slog.LevelDebug {
 		l.sendLog(DEBUG, msg, args...)
 	}
 }
@@ -181,9 +189,8 @@ func (l *Logger) With(attrs ...any) *Logger {
 	return &Logger{
 		logger: l.logger.With(attrs...),
 		client: l.client,
-		url:    l.url,
-		apiKey: l.apiKey,
 		isOk:   l.isOk,
+		opts:   l.opts,
 	}
 }
 
@@ -191,9 +198,8 @@ func (l *Logger) WithGroup(name string) *Logger {
 	return &Logger{
 		logger: l.logger.WithGroup(name),
 		client: l.client,
-		url:    l.url,
-		apiKey: l.apiKey,
 		isOk:   l.isOk,
+		opts:   l.opts,
 	}
 }
 
