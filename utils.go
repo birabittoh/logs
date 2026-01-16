@@ -28,7 +28,7 @@ func (l *Logger) prepare(level, msg string, args ...any) *http.Request {
 	data := make(map[string]string)
 	length := len(args)
 	if length%2 != 0 {
-		length-- // ignore last arg if odd
+		args = append(args, "")
 	}
 
 	for i := 0; i < length; i += 2 {
@@ -46,8 +46,6 @@ func (l *Logger) prepare(level, msg string, args ...any) *http.Request {
 		Source:    l.opts.Source,
 		Args:      data,
 	}
-	// DEBUG: Print Args to diagnose marshal error test
-	fmt.Printf("prepare: Args = %#v\n", data)
 
 	logBytes, err := json.Marshal(log)
 	if err != nil {
