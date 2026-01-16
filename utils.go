@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+func isStatusOK(code int) bool {
+	return code >= 200 && code < 300
+}
+
 func (l *Logger) checkDispatcher() bool {
 	if l.opts.URL == "" {
 		return false
@@ -16,7 +20,7 @@ func (l *Logger) checkDispatcher() bool {
 
 	url := l.opts.URL + l.opts.HealthEndpoint
 	res, err := l.client.Get(url)
-	l.isOk = (err == nil && res.StatusCode == http.StatusOK)
+	l.isOk = (err == nil && isStatusOK(res.StatusCode))
 	return l.isOk
 }
 
@@ -76,7 +80,7 @@ func (l *Logger) dispatch(req *http.Request) {
 	}
 
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
+	if !isStatusOK(res.StatusCode) {
 		l.logger.Warn("Dispatcher returned unexpected status", "code", res.StatusCode)
 	}
 }
