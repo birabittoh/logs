@@ -69,6 +69,10 @@ func New(handler slog.Handler, opts Options) *Logger {
 		opts.HeartbeatInterval = 5 * time.Minute
 	}
 
+	if opts.DispatchEndpoint == "" {
+		opts.DispatchEndpoint = "/api/log"
+	}
+
 	if opts.HealthEndpoint == "" {
 		opts.HealthEndpoint = opts.DispatchEndpoint
 	}
