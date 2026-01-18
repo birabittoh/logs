@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseLogLevel(t *testing.T) {
@@ -38,7 +39,6 @@ type testErr struct{}
 func (e testErr) Error() string { return "err" }
 
 func TestStringify(t *testing.T) {
-
 	cases := []struct {
 		in   any
 		want string
@@ -65,12 +65,16 @@ func newTestLogger() *Logger {
 		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok"))}, nil
 		})},
-		isOk: true,
+		isOk:     true,
+		queue:    make([]Log, 0),
+		stopChan: make(chan struct{}),
 		opts: Options{
 			URL:              "http://localhost",
 			APIKey:           "key",
 			Source:           "src",
 			DispatchEndpoint: "/dispatch",
+			BatchInterval:    100 * time.Millisecond,
+			MaxBatchSize:     10,
 		},
 	}
 }
@@ -81,20 +85,20 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func TestLogger_prepare(t *testing.T) {
+func TestLogger_enqueueLog(t *testing.T) {
 	l := newTestLogger()
-	req := l.prepare("INFO", "msg", "foo", 1, "bar", true)
-	if req == nil {
-		t.Fatal("prepare returned nil")
+	defer l.Close()
+
+	l.enqueueLog("INFO", "msg", "foo", 1, "bar", true)
+
+	l.queueMutex.Lock()
+	defer l.queueMutex.Unlock()
+
+	if len(l.queue) != 1 {
+		t.Fatalf("expected 1 log in queue, got %d", len(l.queue))
 	}
-	if req.Method != http.MethodPost {
-		t.Errorf("expected POST, got %s", req.Method)
-	}
-	if req.Header.Get("X-API-Key") != "key" {
-		t.Errorf("expected API key header")
-	}
-	var log Log
-	_ = json.NewDecoder(req.Body).Decode(&log)
+
+	log := l.queue[0]
 	if log.Level != "INFO" || log.Message != "msg" || log.Source != "src" {
 		t.Errorf("unexpected log fields: %+v", log)
 	}
@@ -103,63 +107,160 @@ func TestLogger_prepare(t *testing.T) {
 	}
 }
 
-func TestLogger_prepare_invalidArgs(t *testing.T) {
+func TestLogger_enqueueLog_invalidArgs(t *testing.T) {
 	l := newTestLogger()
-	req := l.prepare("INFO", "msg", 123, "foo", "bar")
-	if req == nil {
-		t.Fatal("prepare returned nil for invalid args")
+	defer l.Close()
+
+	l.enqueueLog("INFO", "msg", 123, "foo", "bar")
+
+	l.queueMutex.Lock()
+	defer l.queueMutex.Unlock()
+
+	if len(l.queue) != 1 {
+		t.Fatalf("expected 1 log in queue for invalid args, got %d", len(l.queue))
 	}
 }
 
-func TestLogger_prepare_requestError(t *testing.T) {
+func TestLogger_enqueueLog_maxBatchSize(t *testing.T) {
 	l := newTestLogger()
+	defer l.Close()
+
+	l.opts.MaxBatchSize = 2
+	l.isOk = true
+
+	l.enqueueLog("INFO", "msg1")
+	l.enqueueLog("INFO", "msg2")
+
+	time.Sleep(50 * time.Millisecond)
+
+	l.queueMutex.Lock()
+	queueLen := len(l.queue)
+	l.queueMutex.Unlock()
+
+	if queueLen != 0 {
+		t.Errorf("expected queue to be flushed when max batch size reached, got %d logs", queueLen)
+	}
+}
+
+func TestLogger_prepareBatch(t *testing.T) {
+	l := newTestLogger()
+	defer l.Close()
+
+	batch := []Log{
+		{Level: "INFO", Message: "msg1", Timestamp: time.Now(), Source: "src"},
+		{Level: "ERROR", Message: "msg2", Timestamp: time.Now(), Source: "src"},
+	}
+
+	req := l.prepareBatch(batch)
+	if req == nil {
+		t.Fatal("prepareBatch returned nil")
+	}
+
+	if req.Method != http.MethodPost {
+		t.Errorf("expected POST, got %s", req.Method)
+	}
+
+	if req.Header.Get("X-API-Key") != "key" {
+		t.Errorf("expected API key header")
+	}
+
+	var logs []Log
+	err := json.NewDecoder(req.Body).Decode(&logs)
+	if err != nil {
+		t.Fatalf("failed to decode batch: %v", err)
+	}
+
+	if len(logs) != 2 {
+		t.Errorf("expected 2 logs in batch, got %d", len(logs))
+	}
+}
+
+func TestLogger_prepareBatch_requestError(t *testing.T) {
+	l := newTestLogger()
+	defer l.Close()
+
 	l.opts.URL = string([]byte{0x7f}) // invalid URL
-	req := l.prepare("INFO", "msg")
+
+	batch := []Log{{Level: "INFO", Message: "msg", Timestamp: time.Now()}}
+	req := l.prepareBatch(batch)
 	if req != nil {
 		t.Error("expected nil request on request error")
 	}
 }
 
-func TestLogger_dispatch_success(t *testing.T) {
+func TestLogger_dispatchBatch_success(t *testing.T) {
 	l := newTestLogger()
-	req := l.prepare("INFO", "msg")
-	l.dispatch(req)
+	defer l.Close()
+
+	batch := []Log{{Level: "INFO", Message: "msg", Timestamp: time.Now(), Source: "src"}}
+	req := l.prepareBatch(batch)
+	l.dispatchBatch(req)
+
 	if !l.isOk {
 		t.Error("isOk should be true on success")
 	}
 }
 
-func TestLogger_dispatch_error(t *testing.T) {
+func TestLogger_dispatchBatch_error(t *testing.T) {
 	l := newTestLogger()
+	defer l.Close()
+
 	l.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return nil, errors.New("fail")
 	})}
-	req := l.prepare("INFO", "msg")
-	l.dispatch(req)
+
+	batch := []Log{{Level: "INFO", Message: "msg", Timestamp: time.Now(), Source: "src"}}
+	req := l.prepareBatch(batch)
+	l.dispatchBatch(req)
+
 	if l.isOk {
 		t.Error("isOk should be false on error")
 	}
 }
 
-func TestLogger_dispatch_statusNotOK(t *testing.T) {
+func TestLogger_dispatchBatch_statusNotOK(t *testing.T) {
 	l := newTestLogger()
+	defer l.Close()
+
 	l.client = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusBadRequest, Body: io.NopCloser(strings.NewReader("fail"))}, nil
 	})}
-	req := l.prepare("INFO", "msg")
-	l.dispatch(req)
+
+	batch := []Log{{Level: "INFO", Message: "msg", Timestamp: time.Now(), Source: "src"}}
+	req := l.prepareBatch(batch)
+	l.dispatchBatch(req)
 }
 
-func TestLogger_sendLog(t *testing.T) {
+func TestLogger_flushQueue(t *testing.T) {
 	l := newTestLogger()
-	l.sendLog("INFO", "msg")
-	l.opts.URL = ""
-	l.sendLog("INFO", "msg") // should do nothing
+	defer l.Close()
+
+	l.enqueueLog("INFO", "msg1")
+	l.enqueueLog("INFO", "msg2")
+
+	l.flushQueue()
+
+	l.queueMutex.Lock()
+	queueLen := len(l.queue)
+	l.queueMutex.Unlock()
+
+	if queueLen != 0 {
+		t.Errorf("expected queue to be empty after flush, got %d logs", queueLen)
+	}
 }
 
-func TestLogger_sendLogSync(t *testing.T) {
+func TestLogger_flushQueue_emptyURL(t *testing.T) {
 	l := newTestLogger()
-	l.sendLogSync("INFO", "msg")
+	defer l.Close()
+
 	l.opts.URL = ""
-	l.sendLogSync("INFO", "msg") // should do nothing
+	l.enqueueLog("INFO", "msg")
+	l.flushQueue()
+}
+
+func TestLogger_flushQueue_emptyQueue(t *testing.T) {
+	l := newTestLogger()
+	defer l.Close()
+
+	l.flushQueue()
 }

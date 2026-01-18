@@ -1,0 +1,41 @@
+logs
+----
+
+A simple slog wrapper.
+
+Example
+-------
+
+package main
+
+import (
+	"log/slog"
+	"os"
+	"time"
+
+	"your-module/logs"
+)
+
+func main() {
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{ Level: slog.LevelDebug })
+
+	logger := logs.New(handler, logs.Options{
+		URL:               "https://your-log-server.com",
+		APIKey:            "your-api-key",
+		Source:            "my-app",
+		DispatchEndpoint:  "/api/logs",
+		HealthEndpoint:    "/health",
+		HeartbeatInterval: 5 * time.Minute,
+		MinDispatchLevel:  slog.LevelInfo,
+		BatchInterval:     10 * time.Second,
+		MaxBatchSize:      50,
+	})
+	defer logger.Close()
+
+	// Usa il logger
+	logger.Debug("Debug message", "user_id", 123)
+	logger.Info("User logged in", "username", "alice", "ip", "192.168.1.1")
+	logger.Warn("High memory usage", "usage_percent", 85)
+	logger.Error("Database connection failed", "error", "timeout")
+	logger.Fatal("Critical error", "service", "payment")
+}

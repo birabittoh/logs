@@ -1,11 +1,11 @@
 package logs
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 )
 
@@ -24,7 +24,7 @@ func (l *Logger) checkDispatcher() bool {
 	return l.isOk
 }
 
-func (l *Logger) prepare(level, msg string, args ...any) *http.Request {
+func (l *Logger) enqueueLog(level, msg string, args ...any) {
 	data := make(map[string]string)
 	length := len(args)
 	if length%2 != 0 {
@@ -47,15 +47,49 @@ func (l *Logger) prepare(level, msg string, args ...any) *http.Request {
 		Args:      data,
 	}
 
-	logBytes, err := json.Marshal(log)
+	l.queueMutex.Lock()
+	defer l.queueMutex.Unlock()
+
+	l.queue = append(l.queue, log)
+
+	if len(l.queue) >= l.opts.MaxBatchSize {
+		go l.flushQueue()
+	}
+}
+
+func (l *Logger) flushQueue() {
+	if l.opts.URL == "" {
+		return
+	}
+
+	l.queueMutex.Lock()
+	if len(l.queue) == 0 {
+		l.queueMutex.Unlock()
+		return
+	}
+
+	batch := make([]Log, len(l.queue))
+	copy(batch, l.queue)
+	l.queue = l.queue[:0]
+	l.queueMutex.Unlock()
+
+	req := l.prepareBatch(batch)
+	if req == nil {
+		return
+	}
+
+	l.dispatchBatch(req)
+}
+
+func (l *Logger) prepareBatch(batch []Log) *http.Request {
+	logBytes, err := json.Marshal(batch)
 	if err != nil {
-		l.logger.Error("Failed to marshal log to JSON", "error", err.Error())
+		l.logger.Error("Failed to marshal batch to JSON", "error", err.Error())
 		return nil
 	}
 
 	dispatchURL := l.opts.URL + l.opts.DispatchEndpoint
-	reader := strings.NewReader(string(logBytes))
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, dispatchURL, reader)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, dispatchURL, bytes.NewReader(logBytes))
 	if err != nil {
 		l.logger.Error("Failed to create request to dispatcher", "error", err.Error())
 		return nil
@@ -69,11 +103,11 @@ func (l *Logger) prepare(level, msg string, args ...any) *http.Request {
 	return req
 }
 
-func (l *Logger) dispatch(req *http.Request) {
+func (l *Logger) dispatchBatch(req *http.Request) {
 	res, err := l.client.Do(req)
 	if err != nil {
 		l.isOk = false
-		l.logger.Warn("Failed to send log to dispatcher", "error", err.Error())
+		l.logger.Warn("Failed to send batch to dispatcher", "error", err.Error())
 		return
 	}
 
@@ -81,32 +115,6 @@ func (l *Logger) dispatch(req *http.Request) {
 	if !isStatusOK(res.StatusCode) {
 		l.logger.Warn("Dispatcher returned unexpected status", "code", res.StatusCode)
 	}
-}
-
-func (l *Logger) sendLog(level, msg string, args ...any) {
-	if l.opts.URL == "" {
-		return
-	}
-
-	req := l.prepare(level, msg, args...)
-	if req == nil {
-		return
-	}
-
-	go l.dispatch(req)
-}
-
-func (l *Logger) sendLogSync(level, msg string, args ...any) {
-	if l.opts.URL == "" {
-		return
-	}
-
-	req := l.prepare(level, msg, args...)
-	if req == nil {
-		return
-	}
-
-	l.dispatch(req)
 }
 
 func stringify(v any) string {
